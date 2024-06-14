@@ -1,15 +1,14 @@
-use lmdb::{Environment, WriteFlags, Transaction, DatabaseFlags};
-use serde::{Serialize, Deserialize};
-use std::fs;
+use bitcoin::consensus::deserialize;
+use clap::Parser;
 use libbitcoinkernel_sys::{
     BlockManagerOptions, ChainType, ChainstateLoadOptions, ChainstateManager,
     ChainstateManagerOptions,
 };
-use clap::Parser;
-use log::info;
-use bitcoin::consensus::deserialize;
-use std::path::Path;
+use lmdb::{DatabaseFlags, Environment, Transaction, WriteFlags};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::Path;
 
 mod kernel;
 
@@ -30,10 +29,16 @@ struct TxIndex {
     block_height: i32,
     position_in_block: usize,
 }
+
 #[derive(Serialize, Deserialize, Debug)]
 struct TxIndexEntry {
     block_height: i32,
     position_in_block: usize,
+}
+
+#[derive(Clone)]
+struct BlockIndexInfo {
+    block_height: i32,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -77,66 +82,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create (or open) a database
     let db = env.create_db(Some("txindex"), DatabaseFlags::empty())?;
 
-    // Add transactions to the database
-    {
-        let mut block_index_res = chainman.get_block_index_tip();
-        let mut block_counter = 0;
-        let batch_size = 1000;
-
-        let mut tx_batch = vec![];
-        while let Ok(ref block_index) = block_index_res {
-            let raw_block: Vec<u8> = chainman.read_block_data(&block_index).unwrap().into();
-            let block: bitcoin::Block = deserialize(&raw_block).unwrap();
-
-            let transactions_data: Vec<TxIndex> = (0..block.txdata.len() - 1)
-                .into_par_iter()
-                .map(|i| {
-                    let txid = block.txdata[i + 1].compute_txid();
-                    TxIndex {
-                        txid: txid.to_string(),
-                        position_in_block: i,
-                        block_height: block_index.info().unwrap().clone().height,
-                    }
-                })
-                .collect();
-
-            tx_batch.extend(transactions_data);
-
-            block_index_res = block_index_res.unwrap().prev();
-            block_counter += 1;
-
-            if block_counter % batch_size == 0 {
-                let mut txn = env.begin_rw_txn()?;
-                for entry in tx_batch.iter() {
-                    let v = TxIndexEntry {
-                        position_in_block: entry.position_in_block,
-                        block_height: entry.block_height,
-                    };
-                    let serialized = bincode::serialize(&v).unwrap();
-                    txn.put(db, &entry.txid, &serialized, WriteFlags::empty())?;
-                }
-                txn.commit()?;
-                tx_batch.clear();
-                info!("Processed block number: {}", block_counter);
-            }
-        }
-
-        // Commit any remaining transactions
-        if !tx_batch.is_empty() {
-            let mut txn = env.begin_rw_txn()?;
-            for entry in tx_batch.iter() {
-                let v = TxIndexEntry {
-                    position_in_block: entry.position_in_block,
-                    block_height: entry.block_height,
-                };
-                let serialized = bincode::serialize(&v).unwrap();
-                txn.put(db, &entry.txid, &serialized, WriteFlags::empty())?;
-            }
-            txn.commit()?;
-        }
-
-        log::info!("built index!");
+    // Collect block indices
+    let mut block_index_res = chainman.get_block_index_tip();
+    let mut block_indices = Vec::new();
+    while let Ok(ref block_index) = block_index_res {
+        let block_height = block_index.info().unwrap().clone().height;
+        block_indices.push(BlockIndexInfo { block_height });
+        block_index_res = block_index_res.unwrap().prev();
     }
+
+    // Process blocks in parallel
+    let batch_size = 1000;
+    block_indices.par_chunks(batch_size).for_each(|chunk| {
+        let env = &env;
+        let db = db;
+
+        let tx_batch: Vec<TxIndex> = chunk
+            .par_iter()
+            .flat_map(|block_info| {
+                let block_index = chainman
+                    .get_block_index_by_height(block_info.block_height)
+                    .unwrap();
+                let raw_block: Vec<u8> = chainman.read_block_data(&block_index).unwrap().into();
+                let block: bitcoin::Block = deserialize(&raw_block).unwrap();
+
+                (0..block.txdata.len() - 1)
+                    .map(|i| {
+                        let txid = block.txdata[i + 1].compute_txid();
+                        TxIndex {
+                            txid: txid.to_string(),
+                            position_in_block: i,
+                            block_height: block_info.block_height,
+                        }
+                    })
+                    .collect::<Vec<TxIndex>>()
+            })
+            .collect();
+
+        let mut txn = env.begin_rw_txn().unwrap();
+        for entry in tx_batch.iter() {
+            let v = TxIndexEntry {
+                position_in_block: entry.position_in_block,
+                block_height: entry.block_height,
+            };
+            let serialized = bincode::serialize(&v).unwrap();
+            txn.put(db, &entry.txid, &serialized, WriteFlags::empty())
+                .unwrap();
+        }
+        txn.commit().unwrap();
+    });
+
+    log::info!("Built index!");
 
     // Example retrieval of a transaction's block location
     {
@@ -144,15 +140,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let txn = env.begin_ro_txn()?;
         if let Some(data) = txn.get(db, &txid).ok() {
             let txindex: TxIndexEntry = bincode::deserialize(data)?;
-            println!("Transaction ID: {}, Block Location: {}", &txid, txindex.position_in_block);
-            let Ok(ref block_index) = chainman.get_block_index_by_height(txindex.block_height) else { todo!() };
+            println!(
+                "Transaction ID: {}, Block Location: {}",
+                &txid, txindex.position_in_block
+            );
+            let Ok(ref block_index) = chainman.get_block_index_by_height(txindex.block_height)
+            else {
+                todo!()
+            };
             let raw_block: Vec<u8> = chainman.read_block_data(&block_index).unwrap().into();
             let block: bitcoin::Block = deserialize(&raw_block).unwrap();
             let tx = &block.txdata[txindex.position_in_block];
-            println!("full transaction: {:#?}", tx);
+            println!("Full transaction: {:#?}", tx);
         }
     }
 
     Ok(())
 }
-
