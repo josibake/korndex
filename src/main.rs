@@ -9,6 +9,7 @@ use clap::Parser;
 use log::info;
 use bitcoin::consensus::deserialize;
 use std::path::Path;
+use rayon::prelude::*;
 
 mod kernel;
 
@@ -70,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set up the LMDB environment
     let env = Environment::new()
         .set_max_dbs(10)
-        .set_map_size(1024 * 1024 * 1024)
+        .set_map_size(10 * 1024 * 1024 * 1024) // Increase map size to 10 GB
         .open(path)?;
 
     // Create (or open) a database
@@ -80,12 +81,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let mut block_index_res = chainman.get_block_index_tip();
         let mut block_counter = 0;
+        let batch_size = 1000;
+
+        let mut tx_batch = vec![];
         while let Ok(ref block_index) = block_index_res {
-            let mut txn = env.begin_rw_txn()?;
             let raw_block: Vec<u8> = chainman.read_block_data(&block_index).unwrap().into();
             let block: bitcoin::Block = deserialize(&raw_block).unwrap();
 
             let transactions_data: Vec<TxIndex> = (0..block.txdata.len() - 1)
+                .into_par_iter()
                 .map(|i| {
                     let txid = block.txdata[i + 1].compute_txid();
                     TxIndex {
@@ -96,25 +100,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .collect();
 
+            tx_batch.extend(transactions_data);
 
+            block_index_res = block_index_res.unwrap().prev();
+            block_counter += 1;
 
-            for entry in transactions_data.iter() {
+            if block_counter % batch_size == 0 {
+                let mut txn = env.begin_rw_txn()?;
+                for entry in tx_batch.iter() {
+                    let v = TxIndexEntry {
+                        position_in_block: entry.position_in_block,
+                        block_height: entry.block_height,
+                    };
+                    let serialized = bincode::serialize(&v).unwrap();
+                    txn.put(db, &entry.txid, &serialized, WriteFlags::empty())?;
+                }
+                txn.commit()?;
+                tx_batch.clear();
+                info!("Processed block number: {}", block_counter);
+            }
+        }
+
+        // Commit any remaining transactions
+        if !tx_batch.is_empty() {
+            let mut txn = env.begin_rw_txn()?;
+            for entry in tx_batch.iter() {
                 let v = TxIndexEntry {
                     position_in_block: entry.position_in_block,
                     block_height: entry.block_height,
                 };
                 let serialized = bincode::serialize(&v).unwrap();
-                let _ = txn.put(db, &entry.txid, &serialized, WriteFlags::empty());
-
-            };
-
-            block_index_res = block_index_res.unwrap().prev();
-            block_counter += 1;
-            if block_counter % 1000 == 0 {
-                info!("Processed block number: {}", block_counter);
+                txn.put(db, &entry.txid, &serialized, WriteFlags::empty())?;
             }
             txn.commit()?;
         }
+
         log::info!("built index!");
     }
 
@@ -135,3 +155,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
